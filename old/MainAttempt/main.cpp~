@@ -1,0 +1,122 @@
+#include "fiducial.hpp"
+
+// Global variables
+SerialStream ardu;
+const int BUFFER_SIZE = 4;
+char output_buffer[BUFFER_SIZE];
+char ready = 0;
+
+int main(int argc, char *argv[]) {
+    CommandLineParser parser(argc, argv, keys);
+    parser.about(about);
+
+    if(argc < 2) {
+        parser.printMessage();
+        return 0;
+    }
+
+    // Init and configure serial comm
+    ardu.Open(PORT);    
+    ardu.SetBaudRate(SerialStreamBuf::BAUD_9600);  
+    ardu.SetCharSize(SerialStreamBuf::CHAR_SIZE_8);
+
+    // cmd line input params - I think these are part of the Aruco library
+    int dictionaryId = parser.get<int>("d");
+    float markerLength = parser.get<float>("l");
+	//bool doCenterCalibration = parser.get<bool>("c");
+	int camId = parser.get<int>("ci");
+
+	bool doCenterCalibration = true;
+
+    aruco::DetectorParameters detectorParams;
+    detectorParams.doCornerRefinement = false; // do corner refinement in markers
+
+    if(!parser.check()) {
+        parser.printErrors();
+        return 0;
+    }
+    aruco::Dictionary dictionary =
+        aruco::getPredefinedDictionary(aruco::PREDEFINED_DICTIONARY_NAME(dictionaryId));
+    
+    // create video object
+    VideoCapture inputVideo;
+    inputVideo.open(camId);
+    int waitTime = 10;
+
+    // set and verify frame size
+    inputVideo.set(CV_CAP_PROP_FRAME_WIDTH,frame_width_px);
+    int frame_height_px = (int) (0.75 * frame_width_px);
+    inputVideo.set(CV_CAP_PROP_FRAME_HEIGHT,frame_height_px);
+    cout << inputVideo.get(CV_CAP_PROP_FRAME_WIDTH) << " " << inputVideo.get(CV_CAP_PROP_FRAME_HEIGHT) << endl;
+
+    // timekeeping params
+    double totalTime = 0;
+    int totalIterations = 0;
+
+    // detection loop starts here
+    while(inputVideo.grab()) {
+
+        Mat image, imageCopy;
+        inputVideo.retrieve(image);
+
+        double tick = (double)getTickCount(); // start timing
+
+        vector< int > ids;
+        vector< vector< Point2f > > corners, rejected;
+
+        // detect markers
+        aruco::detectMarkers(image, dictionary, corners, ids, detectorParams, rejected);
+
+        double currentTime = ((double)getTickCount() - tick) / getTickFrequency(); // compute and print elapsed time
+        totalTime += currentTime;
+        totalIterations++;
+        if(totalIterations % 30 == 0) {
+            cout << "Detection Time = " << currentTime * 1000 << " ms "
+                 << "(Mean = " << 1000 * totalTime / double(totalIterations) << " ms)" << endl;
+        }
+       
+        // do center calibration if requested
+		Point2f neutralPosition;
+        neutralPosition.x = frame_width_px/2;
+		neutralPosition.y = 0.4; // totally arbitrary, in m
+
+     	// send location data to serial if found	
+	    if( corners.size() != 0) {
+
+            while (ready == 0) {
+                // do init
+                cout << "Marker detected. Move marker to neutral position..." << endl;
+				neutralPosition = get_neutral(corners[0]);
+                ardu.get(ready);
+            }
+
+			Point2f lean_distance = get_lean(corners[0], neutralPosition);
+
+			int x = (int) (1000 * lean_distance.x); // Convert to mm in ints because sending floats sux
+			int y = (int) (1000 * lean_distance.y); // Should probably do this in get_lean...
+			cout << "lean roll = " << x << "/ lean pitch = " << y << endl;
+		
+			output_buffer[0] = x & 0xff;
+			output_buffer[1] = (x >> 8) & 0xff;
+		
+			output_buffer[2] = y & 0xff;
+			output_buffer[3] = (y >> 8) & 0xff;
+
+			ardu.write(output_buffer, BUFFER_SIZE);
+		
+	    }
+
+        // draw results
+        image.copyTo(imageCopy);
+        if(ids.size() > 0) {
+            aruco::drawDetectedMarkers(imageCopy, corners, ids);
+	    }
+        imshow("out", imageCopy);
+        char key = (char)waitKey(waitTime);
+        if(key == 27) break;
+
+        }
+
+    return 0;
+}
+
